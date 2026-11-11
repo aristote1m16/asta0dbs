@@ -1,0 +1,185 @@
+# ─────────────────────────────────────────────────────────────────
+#  Windows RDP via Ngrok  ·  Asta edition
+#  Original script + 2 additions only:
+#    1. WinRAR (choco install, one line)
+#    2. D:\Temp replaces system TEMP — 20 GB ceiling in watchdog
+#  Everything else is the original, character for character.
+# ─────────────────────────────────────────────────────────────────
+name: Windows RDP via Ngrok
+
+on: [push]
+
+env:
+  RDP_USER: "Asta1m16"
+  RDP_PASS: "Asta@123"
+
+jobs:
+  rdp-setup:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      - name: Cache Ngrok binary
+        id: ngrok-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\_ngrok_cache
+          key: ngrok-windows-amd64-stable-v1
+
+      - name: Download Ngrok
+        if: steps.ngrok-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $dest = "$env:GITHUB_WORKSPACE\_ngrok_cache"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $tmp = "$env:RUNNER_TEMP\ngrok.zip"
+          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-windows-amd64.zip" -OutFile $tmp -UseBasicParsing
+          Expand-Archive $tmp -DestinationPath $dest -Force
+          Remove-Item $tmp
+          Write-Output "ngrok downloaded"
+
+      - name: Stage Ngrok binary
+        shell: pwsh
+        run: |
+          Copy-Item "$env:GITHUB_WORKSPACE\_ngrok_cache\ngrok.exe" "$env:GITHUB_WORKSPACE\ngrok.exe"
+          Write-Output "ngrok.exe staged"
+
+      - name: Configure RDP and Firewall
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-Ngrok" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -ErrorAction SilentlyContinue | Out-Null
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 0
+          Write-Output "RDP and firewall configured"
+
+      - name: Create Admin User
+        shell: pwsh
+        run: |
+          net user $env:RDP_USER $env:RDP_PASS /add
+          net localgroup administrators $env:RDP_USER /add
+          net user $env:RDP_USER /expires:never
+          Write-Output "User created: $env:RDP_USER"
+
+      - name: Install WinRAR
+        shell: pwsh
+        run: |
+          choco install winrar -y --no-progress
+          Write-Output "WinRAR installed"
+
+      - name: Set D Temp
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "D:\Temp" | Out-Null
+          $k = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+          Set-ItemProperty $k -Name TEMP -Value "D:\Temp"
+          Set-ItemProperty $k -Name TMP  -Value "D:\Temp"
+          Write-Output "TEMP -> D:\Temp"
+
+      - name: Authenticate Ngrok
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "$env:GITHUB_WORKSPACE\ngrok.exe" authtoken "${{ secrets.NGROK_AUTH_TOKEN }}"
+          Write-Output "Ngrok authenticated"
+
+      - name: Run Session
+        shell: pwsh
+        run: |
+          $ws      = $env:GITHUB_WORKSPACE
+          $rdpUser = $env:RDP_USER
+          $rdpPass = $env:RDP_PASS
+          $logFile = "$ws\ngrok.log"
+
+          function Start-Ngrok {
+            return Start-Process "$ws\ngrok.exe" `
+              -ArgumentList "tcp 3389 --log=stdout --log-format=json" `
+              -NoNewWindow -RedirectStandardOutput $logFile -PassThru
+          }
+
+          $ngrokProc = Start-Ngrok
+          Write-Output "Ngrok PID: $($ngrokProc.Id)"
+
+          $tunnelUrl = $null
+          foreach ($wait in 2,2,3,3,5,5,10,10,10,10) {
+            Start-Sleep $wait
+            try {
+              $tunnels = (Invoke-RestMethod "http://localhost:4040/api/tunnels" -ErrorAction Stop).tunnels
+              if ($tunnels.Count -gt 0) {
+                $tunnelUrl = $tunnels[0].public_url -replace "tcp://", ""
+                break
+              }
+            } catch {}
+            $hit = Get-Content $logFile -ErrorAction SilentlyContinue |
+                   Select-String '"url":"tcp://([^"]+)"' |
+                   Select-Object -Last 1
+            if ($hit) {
+              $tunnelUrl = $hit.Matches.Groups[1].Value
+              break
+            }
+          }
+
+          if (-not $tunnelUrl) {
+            Write-Output "::error::Ngrok tunnel failed to start"
+            Get-Content $logFile -ErrorAction SilentlyContinue | Select-Object -Last 30
+            exit 1
+          }
+
+          Write-Output "============================================"
+          Write-Output "  RDP READY"
+          Write-Output "============================================"
+          Write-Output "  Address  : $tunnelUrl"
+          Write-Output "  Username : $rdpUser"
+          Write-Output "  Password : $rdpPass"
+          Write-Output "  Win+R -> mstsc -> $tunnelUrl"
+          Write-Output "============================================"
+
+          $desk = "C:\Users\$rdpUser\Desktop"
+          try {
+            New-Item -ItemType Directory -Force -Path $desk | Out-Null
+            $info  = "RDP Connection Details"
+            $info += "`nAddress  : $tunnelUrl"
+            $info += "`nUsername : $rdpUser"
+            $info += "`nPassword : $rdpPass"
+            $info | Out-File "$desk\rdp-info.txt" -Encoding UTF8
+          } catch {}
+
+          $tick = 0
+          while ($true) {
+            Start-Sleep -Seconds 60
+            $tick++
+
+            if ($ngrokProc.HasExited) {
+              Write-Output "Ngrok exited (code: $($ngrokProc.ExitCode)) - restarting"
+              Clear-Content $logFile -ErrorAction SilentlyContinue
+              $ngrokProc = Start-Ngrok
+              Start-Sleep 8
+              Write-Output "Ngrok restarted - PID $($ngrokProc.Id)"
+            }
+
+            # D:\Temp ceiling — every 30 min, purge oldest down to 15 GB
+            if ($tick % 30 -eq 0) {
+              $items = Get-ChildItem "D:\Temp" -Force -EA SilentlyContinue | Sort-Object LastWriteTime
+              $usedGB = [math]::Round(($items | Measure-Object Length -Sum).Sum / 1GB, 2)
+              if ($usedGB -gt 20) {
+                foreach ($item in $items) {
+                  if ($usedGB -le 15) { break }
+                  $usedGB -= [math]::Round($item.Length / 1GB, 4)
+                  Remove-Item $item.FullName -Recurse -Force -EA SilentlyContinue
+                }
+                Write-Output "D:\Temp purged to ~$([math]::Round($usedGB,2)) GB"
+              }
+            }
+
+            if ($tick % 10 -eq 0) {
+              Write-Output "Session alive - $tick min elapsed"
+            }
+          }
+
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          Stop-Process -Name "ngrok" -Force -ErrorAction SilentlyContinue
+          Write-Output "Cleanup complete"
